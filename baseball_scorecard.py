@@ -1,6 +1,7 @@
 import pandas as pd
 import re
 import os
+from pybaseball import statcast
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Flowable
 from reportlab.lib.pagesizes import landscape, letter
 from reportlab.lib.styles import getSampleStyleSheet
@@ -10,6 +11,19 @@ from reportlab.platypus import PageBreak
 import spacy
 from spacy import displacy
 from spacy.matcher import Matcher
+
+def fetch_statcast_data(game_date):
+    print(f"📥 Fetching play-by-play data for {game_date}...")
+    df = statcast(start_dt=game_date, end_dt=game_date)
+
+    if df.empty:
+        print("⚠ No data found for this date. Please check the game date and try again.")
+        return None
+
+    # ✅ Standardize inning formatting
+    df = df.sort_values(by=['inning', 'at_bat_number'], ascending=[True, True]).reset_index(drop=True)
+    
+    return df
 
 # Log unrecognized play descriptions for future review
 UNKNOWN_PLAYS_LOG = "unknown_plays.txt"
@@ -34,6 +48,16 @@ def refine_inning(inn):
         elif inn.lower().startswith(('t', 'b')) and inn[1:].isdigit():
             return inn
     return None
+
+def extract_player_name(description):
+
+##    Extracts the first proper noun (likely the player's name) from the description.
+
+    doc = nlp(description)
+    for token in doc:
+        if token.pos_ == "PROPN":  # ✅ Looks for the first proper noun
+            return token.text
+    return "Unknown"  # Fallback if no name is found
 
 # Parse play description outcomes
 def parse_play_description(description):
@@ -268,7 +292,7 @@ class BaseballDiamondGraphic(Flowable):
         d.setFillColor(colors.black)
         d.drawCentredString(0, -size / 8, self.outcome)
 # Generate the PDF
-def save_combined_scorecard(team_scorecards, output_pdf):
+def save_combined_scorecard(df, output_pdf):
     doc = SimpleDocTemplate(output_pdf, pagesize=landscape(letter))
     styles = getSampleStyleSheet()
     elements = []
@@ -289,11 +313,11 @@ def save_combined_scorecard(team_scorecards, output_pdf):
         
 
         # Table headers
-        table_data = [['Batter'] + [str(i) for i in range(1, 10)] + ['PA', 'H', 'BB', 'SO']]
+        table_data = [['batter'] + [str(i) for i in range(1, 10)] + ['PA', 'H', 'BB', 'SO']]
 
         # Add rows with diamond graphics
         for _, row in batter_stats.iterrows():
-            row_data = [row['Batter']]
+            row_data = [row['batter']]
             for i in range(1, 10):
                 outcome = row[str(i)]
                 row_data.append(Paragraph(outcome if outcome else '-', styles['Normal']))
@@ -315,6 +339,34 @@ def save_combined_scorecard(team_scorecards, output_pdf):
 
         elements.append(table)
 
+        # **Pitcher Stats Section**
+        elements.append(Paragraph(f"<b>Pitching Stats - {team}</b>", styles['Heading2']))
+        elements.append(Spacer(1, 10))
+
+        pitcher_table_data = [['pitcher', 'IP', 'ER', 'H', 'HR', 'BB', 'K']]
+        for pitcher, stats in pitcher_stats.items():
+            team_pitchers = play_by_play_data.loc[play_by_play_data['pitcher'] == pitcher, ['home_team', 'away_team']].drop_duplicates()
+            print(f"DEBUG: Checking pitcher -> {pitcher}, Stats: {stats}")  # ✅ Debugging Pitchers
+            if team in team_pitchers:  # ✅ Ensure correct team is displayed
+                print(f"DEBUG: Adding pitcher stats for {pitcher} to {team}")
+                pitcher_table_data.append([
+                    pitcher, round(stats['IP'], 1), stats['ER'], stats['H'], stats['HR'], stats['BB'], stats['K']
+                ])
+
+        # **Format Pitcher Table**
+        pitcher_table = Table(pitcher_table_data, colWidths=[120, 50, 50, 50, 50, 50, 50])
+        pitcher_table.setStyle(TableStyle([
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'),
+        ]))
+
+        elements.append(pitcher_table)
+        elements.append(Spacer(1, 20))
+
         if idx < len(team_scorecards) - 1:
             elements.append(PageBreak()) # ✅ Separate each team's scorecard onto a new page
         
@@ -323,20 +375,26 @@ def save_combined_scorecard(team_scorecards, output_pdf):
     print(f"PDF scorecard saved at: {output_pdf}")
 
 # Process play-by-play data
-def process_play_by_play(input_excel):
-    print(f"Loading play-by-play data from: {input_excel}")
-    play_by_play_data = pd.read_excel(input_excel)
-    play_by_play_data['@Bat'] = play_by_play_data['@Bat'].ffill()  # Fill missing team values due to merged cells
-    required_columns = ['Inn', 'Batter', 'Play Description', '@Bat']
-    for col in required_columns:
-        if col not in play_by_play_data.columns:
-            raise KeyError(f"Missing expected column in Excel file: {col}")
-    play_by_play_data = play_by_play_data.dropna(subset=['Inn', 'Batter', 'Play Description'])
-    play_by_play_data['Refined Inn'] = play_by_play_data['Inn'].apply(refine_inning)
+def process_play_by_play(df):
+    
+    # ✅ Extract relevant columns
+    df_filtered = df[['inning', 'inning_topbot', 'des', 'batter']].copy()
+
+    # ✅ Keep only rows where 'events' is not null (final play results)
+    df_filtered = df.dropna(subset=['events']).copy()  # ✅ Keeps only plays with final outcomes
+
+    # ✅ Convert inning to T1, B1 format
+    df_filtered['Refined Inn'] = df_filtered.apply(
+        lambda row: f"T{row['inning']}" if row['inning_topbot'] == "Top" else f"B{row['inning']}", axis=1
+    )
+     # ✅ Parse play descriptions
+    df_filtered['Outcome'] = df_filtered['des'].apply(parse_play_description)
 
     # Group by team
-    grouped_data = play_by_play_data.groupby('@Bat')
+    grouped_data = df_filtered.groupby(['home_team', 'away_team'])
     team_scorecards = {}
+    pitcher_stats = {}
+    play_by_play_data = df_filtered.copy()
     
     # Process each team's data separately
     for team, team_data in grouped_data:
@@ -347,11 +405,49 @@ def process_play_by_play(input_excel):
                 continue
         
     # Initialize batter stats
-        batting_innings = {batter: ['-'] * 9 for batter in team_data['Batter'].dropna().unique()}
+    
+        # ✅ Ensure 'des' column has valid batter names
+        team_data['batter_name'] = team_data['des'].apply(extract_player_name)
+
+        batting_innings = {batter: ['-'] * 9 for batter in team_data['batter_name'].dropna().unique()}
         for _, row in team_data.iterrows():
-            batter = row['Batter']
+            batter = row['batter_name']
+            pitcher = row['pitcher']
             inning = row['Refined Inn']
-            description = row['Play Description']
+            description = row['des']
+
+            # **Initialize Pitcher Stats If Not Tracked**
+            if pitcher not in pitcher_stats:
+                pitcher_stats[pitcher] = {
+                    "IP": 0, "ER": 0, "K": 0, "BB": 0, "H": 0, "HR": 0
+                }
+
+            # **Track Pitching Stats**
+                if 'strikeout' in description or 'struck out' in description:
+                    pitcher_stats[pitcher]["K"] += 1
+            
+                if 'walk' in description or 'base on balls' in description:
+                    pitcher_stats[pitcher]["BB"] += 1
+
+                if 'single' in description:
+                    pitcher_stats[pitcher]["H"] += 1
+                elif 'double' in description:
+                    pitcher_stats[pitcher]["H"] += 1
+                elif 'triple' in description:
+                    pitcher_stats[pitcher]["H"] += 1
+                elif 'home run' in description or 'homer' in description:
+                    pitcher_stats[pitcher]["H"] += 1
+                    pitcher_stats[pitcher]["HR"] += 1  # ✅ Track Home Runs Allowed
+            
+                if 'scores' in description:
+                    pitcher_stats[pitcher]["ER"] += 1
+
+                if any(word in description for word in ['groundout', 'flyout', 'popout', 'lineout', 'strikeout']):
+                    pitcher_stats[pitcher]["IP"] += 1/3  # ✅ Each out = 1/3 of an inning
+
+                # **DEBUG PRINT: Confirm Pitcher Stats Are Being Updated**
+                print(f"DEBUG: Pitcher Stats Updated -> {pitcher}: {pitcher_stats[pitcher]}")
+            
             if inning and inning[1:].isdigit():
                 inning_index = int(inning[1:]) - 1
                 outcome = parse_play_with_nlp(description)
@@ -363,7 +459,7 @@ def process_play_by_play(input_excel):
                 
             
     # Create batter stats DataFrame
-        batter_stats = pd.DataFrame([{"Batter": batter, **{str(i + 1): val for i, val in enumerate(innings)}}
+        batter_stats = pd.DataFrame([{"batter": batter, **{str(i + 1): val for i, val in enumerate(innings)}}
             for batter, innings in batting_innings.items()
     ])
 
@@ -372,6 +468,38 @@ def process_play_by_play(input_excel):
         batter_stats["H"] = batter_stats[[str(i) for i in range(1, 10)]].apply(lambda row: sum(val in ['1B', '2B', '3B', 'HR'] for val in row), axis=1)
         batter_stats["BB"] = batter_stats[[str(i) for i in range(1, 10)]].apply(lambda row: sum(val == 'BB' for val in row), axis=1)
         batter_stats["SO"] = batter_stats[[str(i) for i in range(1, 10)]].apply(lambda row: sum(val == 'K' for val in row), axis=1)
+
+        # **Initialize Pitcher Stats If Not Tracked**
+        if pitcher not in pitcher_stats:
+            pitcher_stats[pitcher] = {
+                    "IP": 0, "ER": 0, "K": 0, "BB": 0, "H": 0, "HR": 0
+                }
+
+            # **Track Pitching Stats**
+            if 'strikeout' in description or 'struck out' in description:
+                pitcher_stats[pitcher]["K"] += 1
+            
+            if 'walk' in description or 'base on balls' in description:
+                pitcher_stats[pitcher]["BB"] += 1
+
+            if 'single' in description:
+                pitcher_stats[pitcher]["H"] += 1
+            elif 'double' in description:
+                pitcher_stats[pitcher]["H"] += 1
+            elif 'triple' in description:
+                pitcher_stats[pitcher]["H"] += 1
+            elif 'home run' in description or 'homer' in description:
+                pitcher_stats[pitcher]["H"] += 1
+                pitcher_stats[pitcher]["HR"] += 1  # ✅ Track Home Runs Allowed
+            
+            if 'scores' in description:
+                pitcher_stats[pitcher]["ER"] += 1
+
+            if any(word in description for word in ['groundout', 'flyout', 'popout', 'lineout', 'strikeout']):
+                pitcher_stats[pitcher]["IP"] += 1/3  # ✅ Each out = 1/3 of an inning
+
+            # **DEBUG PRINT: Confirm Pitcher Stats Are Being Updated**
+            print(f"DEBUG: Pitcher Stats Updated -> {pitcher}: {pitcher_stats[pitcher]}")
     
     # Store team stats separately
         print(f"DEBUG: Batter stats for {team}: \n{batter_stats}")
@@ -383,22 +511,19 @@ def process_play_by_play(input_excel):
     
     print(f"DEBUG: Final teams stored: {list(team_scorecards.keys())}")  # ✅ Check if LAD appears
     
-    return team_scorecards
+    return team_scorecards, pitcher_stats, play_by_play_data
 
 # Main Execution
 if __name__ == "__main__":
-    input_excel = input("Enter the path to the play-by-play Excel file: ").strip()
+    game_date = input("Enter the game date (YYYY-MM-DD): ").strip()
     output_pdf = input("Enter the path to save the PDF scorecard: ").strip()
 
-    if not os.path.exists(input_excel):
-        print(f"Error: File not found at {input_excel}")
-    else:
-        try:
-##            grouped_data = preprocess_data(input_excel)
-            batter_stats = process_play_by_play(input_excel)
-            save_combined_scorecard(batter_stats, output_pdf)
-        except Exception as e:
-            print(f"An error occurred: {e}")
+    df = fetch_statcast_data(game_date)
+
+    if df is not None:
+        team_scorecards, pitcher_stats, play_by_play_data = process_play_by_play(df)
+        save_combined_scorecard(play_by_play_data, output_pdf)  # ✅ Pass play_by_play_data
+            
  # Keep the window open if running in Windows (for debugging purposes)
     input("Press Enter to exit...")
     
