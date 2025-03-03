@@ -2,6 +2,7 @@ import pandas as pd
 import re
 import os
 from pybaseball import statcast
+from pybaseball import playerid_reverse_lookup
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Flowable
 from reportlab.lib.pagesizes import landscape, letter
 from reportlab.lib.styles import getSampleStyleSheet
@@ -49,15 +50,44 @@ def refine_inning(inn):
             return inn
     return None
 
-def extract_player_name(description):
+def extract_player_name(description, batter_id, id_to_name):
 
 ##    Extracts the first proper noun (likely the player's name) from the description.
 
+    # ✅ Check if the batter ID exists in the lookup dictionary
+    if batter_id in id_to_name:
+        return id_to_name[batter_id]  # ✅ Use the official name from MLBAM ID lookup
+
     doc = nlp(description)
-    for token in doc:
-        if token.pos_ == "PROPN":  # ✅ Looks for the first proper noun
-            return token.text
-    return "Unknown"  # Fallback if no name is found
+    team_names ={"Yankees", "Dodgers", "Red Sox", "Mets", "Cubs", "Giants", "Astros", "Phillies"}  # ✅ Expand as needed
+    valid_suffixes = {"Jr.", "Sr.", "III", "II", "IV", "V"}  # ✅ Common name suffixes
+
+    # ✅ Get the first few tokens in the description (to prioritize names)
+    tokens = [token.text for token in doc]
+    
+    # ✅ If the description starts with a team name, remove it and reprocess
+    if tokens[0] in team_names:
+        tokens.pop(0)  # ✅ Remove the first word (team name)
+
+    # ✅ Step 2: If NER fails, check first words manually
+    player_name = []
+    for i, token in enumerate(doc):
+        if token.pos_ == "PROPN" and token.text not in team_names:
+            player_name.append(token.text)
+        elif player_name and token.text in valid_suffixes:  # ✅ Allow suffixes to be added
+            player_name.append(token.text)
+        elif player_name:  # ✅ Stop extraction once a non-name word appears
+            break 
+
+    full_name = " ".join(player_name).strip()
+
+    # ✅ Fallback: If no valid name was found, try extracting first two words manually
+    if len(player_name) < 2 and len(tokens) > 1:
+        full_name = " ".join(tokens[:2])  # ✅ Take the first two words
+        
+        return full_name
+
+    return full_name if len(player_name) >= 2 else "Unknown"
 
 # Parse play description outcomes
 def parse_play_description(description):
@@ -390,6 +420,23 @@ def process_play_by_play(df):
      # ✅ Parse play descriptions
     df_filtered['Outcome'] = df_filtered['des'].apply(parse_play_description)
 
+    # ✅ Ensure batter column is numeric
+    df['batter'] = df['batter'].astype(int)
+
+    # ✅ Get unique batter IDs
+    batter_ids = df['batter'].dropna().unique()
+
+    # ✅ Fetch player names from MLBAM IDs
+    player_info = playerid_reverse_lookup(batter_ids, key_type='mlbam')
+
+    # ✅ Create a dictionary mapping ID -> Full Name
+    id_to_name = {row['key_mlbam']: f"{row['name_first']} {row['name_last']}" for _, row in player_info.iterrows()}
+
+    # ✅ Apply name extraction using the player ID lookup
+    df_filtered['batter_name'] = df_filtered.apply(
+        lambda row: extract_player_name(row['des'], row['batter'], id_to_name), axis=1
+    )
+
     # Group by team
     grouped_data = df_filtered.groupby(['home_team', 'away_team'])
     team_scorecards = {}
@@ -407,7 +454,7 @@ def process_play_by_play(df):
     # Initialize batter stats
     
         # ✅ Ensure 'des' column has valid batter names
-        team_data['batter_name'] = team_data['des'].apply(extract_player_name)
+        team_data['batter_name'] = team_data.apply(lambda row: extract_player_name(row['des'], row['batter'], id_to_name), axis=1)
 
         batting_innings = {batter: ['-'] * 9 for batter in team_data['batter_name'].dropna().unique()}
         for _, row in team_data.iterrows():
